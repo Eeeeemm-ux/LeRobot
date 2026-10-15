@@ -17,7 +17,7 @@ from __future__ import annotations
 import abc
 import importlib
 from dataclasses import dataclass, field, fields
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 import draccus
@@ -25,6 +25,7 @@ import gymnasium as gym
 from gymnasium.envs.registration import registry as gym_registry
 
 from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.env_server.client import EnvClient
 from lerobot.processor import IsaaclabArenaProcessorStep, LiberoProcessorStep, PolicyProcessorPipeline
 from lerobot.robots import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
@@ -44,6 +45,8 @@ from lerobot.utils.constants import (
     OBS_IMAGES,
     OBS_STATE,
 )
+
+from .sim_client import SimVectorEnv
 
 
 def _make_vec_env_cls(use_async: bool, n_envs: int):
@@ -727,7 +730,7 @@ class IsaaclabArenaEnv(HubEnvConfig):
         )
 
 
-class G1EndEffector(str, Enum):
+class G1EndEffector(StrEnum):
     """What the G1's arms carry, by hardware name.
 
     Shared with UnitreeG1Config, which owns the robot-level flag.
@@ -786,7 +789,7 @@ class LiberoPlusEnv(LiberoEnv):
     The gym interface is identical to LIBERO so this class reuses ``LiberoEnv``
     entirely — only the registered name and default task suite differ.
 
-    Install: see docker/Dockerfile.benchmark.libero_plus — LIBERO-plus ships
+    Install: see the libero_plus_native stage of docker/Dockerfile.sim — LIBERO-plus ships
     as a namespace package from a git fork and must be cloned + PYTHONPATH'd
     rather than installed as a pyproject extra.
 
@@ -901,7 +904,7 @@ class RoboMMEEnv(EnvConfig):
     Benchmark: https://github.com/RoboMME/robomme_benchmark
 
     Requires the `robomme` git package installed separately (Linux only);
-    see docker/Dockerfile.benchmark.robomme for the canonical install.
+    see the robomme_native stage of docker/Dockerfile.sim for the canonical install.
     """
 
     task: str = "PickXtimes"
@@ -955,3 +958,54 @@ class RoboMMEEnv(EnvConfig):
             wrist_camera_name=self.wrist_camera_name,
             env_cls=env_cls,
         )
+
+
+@EnvConfig.register_subclass("sim")
+@dataclass
+class SimEnvConfig(EnvConfig):
+    endpoint: str = "tcp/127.0.0.1:7448"
+    deployment: str = "default"
+    timeout_s: float = 120
+    task_ids: list[int] | None = None
+
+    @property
+    def gym_kwargs(self) -> dict:
+        return {}
+
+    def create_envs(self, n_envs: int, use_async_envs: bool = False):
+        if self.max_parallel_tasks != 1:
+            raise ValueError("Use one task at a time per simulator deployment")
+        client = EnvClient(self.endpoint, self.deployment, self.timeout_s)
+        try:
+            descriptor = client.describe()
+        finally:
+            client.close()
+        self.descriptor = descriptor
+        self.fps = int(descriptor.fps)
+        self.features = {
+            f.name: PolicyFeature(
+                type=FeatureType.VISUAL if f.kind == "rgb" else FeatureType.STATE, shape=f.shape
+            )
+            for f in descriptor.features
+        }
+        self.features["action"] = PolicyFeature(
+            type=FeatureType.ACTION, shape=descriptor.action_feature.shape
+        )
+        # Simulator keys reach the policy unchanged; --rename_map aliases them like any env.
+        self.features_map = {name: name for name in self.features}
+        groups = self.task.split(",") if self.task else list(descriptor.tasks)
+        result = {}
+        for group in groups:
+            if group not in descriptor.tasks:
+                raise ValueError(f"Unknown simulator task group: {group}")
+            ids = self.task_ids if self.task_ids is not None else [int(i) for i in descriptor.tasks[group]]
+            if any(str(i) not in descriptor.tasks[group] for i in ids):
+                raise ValueError("Unknown simulator task index")
+            result[group] = {
+                i: SimVectorEnv(self.endpoint, self.deployment, n_envs, group, i, self.timeout_s, descriptor)
+                for i in ids
+            }
+        return result
+
+    def get_env_processors(self):
+        return PolicyProcessorPipeline(steps=[]), PolicyProcessorPipeline(steps=[])
