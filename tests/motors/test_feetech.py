@@ -24,7 +24,12 @@ import pytest
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.encoding_utils import encode_sign_magnitude
 from lerobot.motors.feetech import MODEL_NUMBER, MODEL_NUMBER_TABLE, FeetechMotorsBus
-from lerobot.motors.feetech.tables import STS_SMS_SERIES_CONTROL_TABLE, STS_SMS_SERIES_ENCODINGS_TABLE
+from lerobot.motors.feetech.tables import (
+    FIRMWARE_MAJOR_VERSION,
+    FIRMWARE_MINOR_VERSION,
+    STS_SMS_SERIES_CONTROL_TABLE,
+    STS_SMS_SERIES_ENCODINGS_TABLE,
+)
 
 try:
     import scservo_sdk as scs
@@ -576,3 +581,84 @@ def test_record_ranges_of_motion(mock_motors, dummy_motors):
     mock_sleep.assert_called_once_with(0.02)
     assert mins == expected_mins
     assert maxes == expected_maxes
+
+
+def _stub_motor_identity(mock_motors, numbers, minor_versions=(1, 1, 1)):
+    for id_, (number, minor) in enumerate(zip(numbers, minor_versions, strict=True), start=1):
+        if number is not None:
+            mock_motors.build_ping_stub(id_)
+            mock_motors.build_read_stub(*MODEL_NUMBER, id_, number)
+            mock_motors.build_read_stub(*FIRMWARE_MAJOR_VERSION, id_, 3)
+            mock_motors.build_read_stub(*FIRMWARE_MINOR_VERSION, id_, minor)
+
+
+@pytest.mark.parametrize("numbers", [(777, 777, 777), (2057, 2825, 11272)])
+def test_mixed_models_handshake(mock_motors, dummy_motors, numbers):
+    _stub_motor_identity(mock_motors, numbers)
+    bus = FeetechMotorsBus(port=mock_motors.port, motors=dummy_motors, allow_mixed_models=True)
+
+    bus.connect()
+
+    assert bus.is_connected
+    assert bus.models == ["sts3215"] * 3
+    assert [motor.norm_mode for motor in bus.motors.values()] == [MotorNormMode.RANGE_M100_100] * 3
+    for table in (
+        bus.model_ctrl_table,
+        bus.model_encoding_table,
+        bus.model_resolution_table,
+        bus.model_baudrate_table,
+    ):
+        assert all(table[bus._model_nb_to_model(number)] == table["sts3215"] for number in numbers)
+
+
+@pytest.mark.parametrize("number", [None, 9999, 1284])
+def test_mixed_models_rejects_missing_unknown_or_incompatible_models(mock_motors, dummy_motors, number):
+    _stub_motor_identity(mock_motors, (2057, 2825, number))
+    bus = FeetechMotorsBus(port=mock_motors.port, motors=dummy_motors, allow_mixed_models=True)
+    message = "Missing motor IDs" if number is None else "incorrect model numbers"
+
+    with pytest.raises(RuntimeError, match=message):
+        bus.connect()
+    assert bus.models == ["sts3215"] * 3
+
+
+@pytest.mark.parametrize("numbers", [(777, 777, 777), (2057, 2825, 11272)])
+def test_firmware_must_match_across_models(mock_motors, dummy_motors, numbers):
+    _stub_motor_identity(mock_motors, numbers, minor_versions=(2, 1, 1))
+    bus = FeetechMotorsBus(port=mock_motors.port, motors=dummy_motors, allow_mixed_models=True)
+
+    with pytest.raises(RuntimeError, match="different firmware versions"):
+        bus.connect()
+
+
+def test_mixed_models_are_opt_in(mock_motors, dummy_motors):
+    _stub_motor_identity(mock_motors, (2057, 2825, 11272))
+    bus = FeetechMotorsBus(port=mock_motors.port, motors=dummy_motors)
+
+    with pytest.raises(RuntimeError, match="incorrect model"):
+        bus.connect()
+
+
+@pytest.mark.parametrize("number", [777, 2057, 2825, 11272, 9999, 1284])
+def test_setup_accepts_compatible_models(mock_motors, dummy_motors, number):
+    mock_motors.build_broadcast_ping_stub([42])
+    mock_motors.build_read_stub(*MODEL_NUMBER, 42, number)
+    write_stubs = [
+        mock_motors.build_write_stub(*STS_SMS_SERIES_CONTROL_TABLE[register], id_, value)
+        for register, id_, value in [
+            ("Torque_Enable", 42, 0),
+            ("Lock", 42, 0),
+            ("ID", 42, 1),
+            ("Baud_Rate", 1, 0),
+        ]
+    ]
+    bus = FeetechMotorsBus(port=mock_motors.port, motors=dummy_motors, allow_mixed_models=True)
+
+    if number in (9999, 1284):
+        with pytest.raises(RuntimeError, match="model number"):
+            bus.setup_motor("dummy_1", initial_baudrate=57600)
+        assert all(not mock_motors.stubs[stub].called for stub in write_stubs)
+    else:
+        bus.setup_motor("dummy_1", initial_baudrate=57600)
+        assert all(mock_motors.stubs[stub].wait_called() for stub in write_stubs)
+        assert bus.port_handler.getBaudRate() == bus.default_baudrate
